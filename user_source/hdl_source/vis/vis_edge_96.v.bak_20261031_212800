@@ -1,0 +1,234 @@
+`timescale 1ns / 1ps
+//----------------------------------------------------------------------------
+// vis_edge_96 -- Scharr 边缘检测 (单像素步长版本)
+//
+// 96bit 输入 = 4 x RGB888。每个 beat 算 2 个梯度:
+//     A 以像素 4x+0 为中心, 窗口列 [4x-1, 4x,   4x+1]
+//     B 以像素 4x+2 为中心, 窗口列 [4x+1, 4x+2, 4x+3]
+// 两个窗口合起来覆盖所有列, 不会再漏竖边; 结果按 {A,A,B,B} 铺满 4 个像素,
+// 不会再出现半屏黑。
+//
+// 相对旧版修掉的问题:
+//   1. 旧版窗口每 beat 才移一格, 横向步长是 4 个像素 -> 竖边大量漏检、线条糊
+//   2. 旧版 mag = gx*gx + gy*gy, 但 mag 只声明 15bit -> 溢出截断, 阈值失效、出噪点
+//   3. 旧版行缓存写的是窗口寄存器 {p11,p01} -> 自己吃自己, 边缘位置漂
+//   4. 旧版只输出 {pix_out,pix_out,24'd0,24'd0} -> 每拍一半像素恒黑
+//   5. 旧版端口 th_high / ready 方向和 vis_top 的例化对不上 -> 例化报 port not found
+//
+// 幅值用 L1 范数 |gx| + |gy|, 上限 16*255*2 = 8160, 15bit 放得下, 不会溢出。
+// 阈值 I_edge_th 的含义: 16 权重下的灰阶跳变, 例如 500 约等于 31 个灰阶。
+// 三级流水: 灰度+行缓存读 -> 梯度+比较 -> 输出, tuser/tlast 一起延 3 拍对齐。
+//----------------------------------------------------------------------------
+module vis_edge_96 #(
+    parameter IMG_WIDTH  = 1280,
+    parameter IMG_HEIGHT = 720
+)(
+    input               I_clk,
+    input               I_rst_n,
+    input               I_tlast,
+    input               I_tuser,
+    input      [95:0]   I_tdata,
+    input               I_tvalid,
+    input               I_tready,
+    input      [14:0]   I_edge_th,
+    output reg          O_tlast,
+    output reg          O_tuser,
+    output reg [95:0]   O_tdata,
+    output reg          O_tvalid,
+    output              O_tready
+);
+
+    assign O_tready = I_tready;
+
+    localparam GRP_W = IMG_WIDTH >> 2;
+
+//--------------------------------------------------------------------------
+// 输入拆分与灰度: Y = R/4 + G/2 + B/4, 只有移位和加法
+//--------------------------------------------------------------------------
+    wire [23:0] pix0 = I_tdata[95:72];
+    wire [23:0] pix1 = I_tdata[71:48];
+    wire [23:0] pix2 = I_tdata[47:24];
+    wire [23:0] pix3 = I_tdata[23:0];
+
+    wire [7:0] gray0 = {2'b0,pix0[23:18]} + {1'b0,pix0[15:9]} + {2'b0,pix0[7:2]};
+    wire [7:0] gray1 = {2'b0,pix1[23:18]} + {1'b0,pix1[15:9]} + {2'b0,pix1[7:2]};
+    wire [7:0] gray2 = {2'b0,pix2[23:18]} + {1'b0,pix2[15:9]} + {2'b0,pix2[7:2]};
+    wire [7:0] gray3 = {2'b0,pix3[23:18]} + {1'b0,pix3[15:9]} + {2'b0,pix3[7:2]};
+
+//--------------------------------------------------------------------------
+// 行缓存: 每组 4 个灰度, 共 32bit。
+//   line1_mem 保存上一行, line2_mem 保存上两行。
+//   窗口 = [上两行, 上一行, 当前行], 中心落在上一行, 所以输出比输入晚一行,
+//   但速率是 1:1, 画面只是整体下移一行。
+//--------------------------------------------------------------------------
+    (* ram_style = "block" *) reg [31:0] line1_mem [0:GRP_W-1];
+    (* ram_style = "block" *) reg [31:0] line2_mem [0:GRP_W-1];
+
+    reg [10:0] x_grp;
+    reg [10:0] y_pos;
+
+    wire [31:0] top_word = line2_mem[x_grp];   // 上两行
+    wire [31:0] mid_word = line1_mem[x_grp];   // 上一行
+
+//--------------------------------------------------------------------------
+// 第一级: 灰度、行缓存读出、流控各打一拍, 这样三者严格对齐
+//--------------------------------------------------------------------------
+    reg [31:0] top_r, mid_r;
+    reg  [7:0] g0_r, g1_r, g2_r, g3_r;
+    reg        v1, u1, l1;
+
+    always @(posedge I_clk or negedge I_rst_n) begin
+        if(!I_rst_n) begin
+            top_r <= 32'd0; mid_r <= 32'd0;
+            g0_r <= 8'd0; g1_r <= 8'd0; g2_r <= 8'd0; g3_r <= 8'd0;
+            v1 <= 1'b0; u1 <= 1'b0; l1 <= 1'b0;
+        end else begin
+            top_r <= top_word;
+            mid_r <= mid_word;
+            g0_r <= gray0; g1_r <= gray1; g2_r <= gray2; g3_r <= gray3;
+            v1 <= I_tvalid; u1 <= I_tuser; l1 <= I_tlast;
+        end
+    end
+
+//--------------------------------------------------------------------------
+// 上一组最后一个像素 (列 4x-1), 供窗口 A 的左列使用
+//--------------------------------------------------------------------------
+    reg [7:0] tprev, mprev, bprev;
+
+    always @(posedge I_clk or negedge I_rst_n) begin
+        if(!I_rst_n) begin
+            tprev <= 8'd0; mprev <= 8'd0; bprev <= 8'd0;
+        end else begin
+            tprev <= top_r[31:24];   // 上一组像素 3
+            mprev <= mid_r[31:24];
+            bprev <= g3_r;           // 上一组像素 3
+        end
+    end
+
+    // 当前组 4 个像素
+    wire [7:0] t0 = top_r[7:0];   wire [7:0] t1 = top_r[15:8];
+    wire [7:0] t2 = top_r[23:16]; wire [7:0] t3 = top_r[31:24];
+    wire [7:0] m0 = mid_r[7:0];   wire [7:0] m1 = mid_r[15:8];
+    wire [7:0] m2 = mid_r[23:16]; wire [7:0] m3 = mid_r[31:24];
+
+//--------------------------------------------------------------------------
+// Scharr 算子: 3x = (x<<1)+x, 10x = (x<<3)+(x<<1), 不用乘法器
+//   gx 检测横线, gy 检测竖线, 幅值取 |gx| + |gy|
+//--------------------------------------------------------------------------
+    function [14:0] scharr_mag;
+        input [7:0] a00, a01, a02;
+        input [7:0] a10, a11, a12;
+        input [7:0] a20, a21, a22;
+        reg signed [13:0] gx_f;
+        reg signed [13:0] gy_f;
+        reg [13:0] abs_gx_f;
+        reg [13:0] abs_gy_f;
+        begin
+            gx_f = -(($signed({1'b0,a00}) <<< 1) + $signed({1'b0,a00}))
+                 - (($signed({1'b0,a01}) <<< 3) + ($signed({1'b0,a01}) <<< 1))
+                 - (($signed({1'b0,a02}) <<< 1) + $signed({1'b0,a02}))
+                 + (($signed({1'b0,a20}) <<< 1) + $signed({1'b0,a20}))
+                 + (($signed({1'b0,a21}) <<< 3) + ($signed({1'b0,a21}) <<< 1))
+                 + (($signed({1'b0,a22}) <<< 1) + $signed({1'b0,a22}));
+            gy_f = -(($signed({1'b0,a00}) <<< 1) + $signed({1'b0,a00}))
+                 - (($signed({1'b0,a10}) <<< 3) + ($signed({1'b0,a10}) <<< 1))
+                 - (($signed({1'b0,a20}) <<< 1) + $signed({1'b0,a20}))
+                 + (($signed({1'b0,a02}) <<< 1) + $signed({1'b0,a02}))
+                 + (($signed({1'b0,a12}) <<< 3) + ($signed({1'b0,a12}) <<< 1))
+                 + (($signed({1'b0,a22}) <<< 1) + $signed({1'b0,a22}));
+            abs_gx_f = gx_f[13] ? (~gx_f + 1'b1) : gx_f;
+            abs_gy_f = gy_f[13] ? (~gy_f + 1'b1) : gy_f;
+            scharr_mag = {1'b0, abs_gx_f} + {1'b0, abs_gy_f};
+        end
+    endfunction
+
+    // 窗口 A: 中心像素 4x+0, 列 [4x-1, 4x, 4x+1]
+    wire [14:0] mag_a = scharr_mag(tprev, t0, t1,
+                                   mprev, m0, m1,
+                                   bprev, g0_r, g1_r);
+    // 窗口 B: 中心像素 4x+2, 列 [4x+1, 4x+2, 4x+3]
+    wire [14:0] mag_b = scharr_mag(t1, t2, t3,
+                                   m1, m2, m3,
+                                   g1_r, g2_r, g3_r);
+
+//--------------------------------------------------------------------------
+// 第二级: 梯度、窗口有效标志、流控各打一拍
+//   窗口有效条件: 行号 >= 2 (前两行没有完整 3x3), 且不是每行第一组
+//   (第一组的左列来自上一行末尾, 是无效数据)
+//--------------------------------------------------------------------------
+    reg [14:0] mag_a_r, mag_b_r;
+    reg        wv2, v2, u2, l2;
+
+    // 位置和行号也必须延一拍: 数据是在打拍后的那一拍参与运算的, 直接用
+    // x_grp / y_pos 会整体超前一组, 结果就是每行第一组(左列是上一行末尾的
+    // 陈旧数据)和第一行没被屏蔽, 屏幕左边框出一条假边。
+    reg [10:0] x_grp_d;
+    reg [10:0] y_pos_d;
+
+    wire wv1 = (y_pos_d >= 11'd2) && (x_grp_d != 11'd0) && !u1;
+
+    wire edg_a = wv2 && (mag_a_r >= I_edge_th);
+    wire edg_b = wv2 && (mag_b_r >= I_edge_th);
+
+    wire [23:0] out_a = edg_a ? 24'hffffff : 24'h000000;
+    wire [23:0] out_b = edg_b ? 24'hffffff : 24'h000000;
+
+//--------------------------------------------------------------------------
+// 第三级: 输出 + 行缓存写入 + 地址计数 (地址一律用打拍前的旧值)
+//--------------------------------------------------------------------------
+    always @(posedge I_clk or negedge I_rst_n) begin
+        if(!I_rst_n) begin
+            O_tdata  <= 96'd0;
+            O_tvalid <= 1'b0;
+            O_tlast  <= 1'b0;
+            O_tuser  <= 1'b0;
+            mag_a_r  <= 15'd0; mag_b_r <= 15'd0;
+            wv2 <= 1'b0; v2 <= 1'b0; u2 <= 1'b0; l2 <= 1'b0;
+            x_grp <= 11'd0;
+            y_pos <= 11'd0;
+            x_grp_d <= 11'd0;
+            y_pos_d <= 11'd0;
+            // 行缓存不做复位: 复位环会把这些 10Kbit 的缓冲变成 slice 寄存器。
+            // 前两行由 wv1 屏蔽, 第二帧起数据自然填满。
+        end else begin
+            // ---- 第二级 ----
+            mag_a_r <= mag_a;
+            mag_b_r <= mag_b;
+            wv2 <= wv1;
+            v2 <= v1; u2 <= u1; l2 <= l1;
+            x_grp_d <= x_grp;
+            y_pos_d <= y_pos;
+
+            // ---- 第三级: 输出, 4 个像素全部有值 ----
+            O_tvalid <= v2;
+            O_tlast  <= l2;
+            O_tuser  <= u2;
+            if(v2)
+                O_tdata <= {out_a, out_a, out_b, out_b};
+            else
+                O_tdata <= 96'd0;
+
+            // ---- 行缓存与地址 ----
+            if(I_tvalid) begin
+                line2_mem[x_grp] <= mid_word;                       // 上一行 -> 上两行
+                line1_mem[x_grp] <= {gray3, gray2, gray1, gray0};   // 当前行 -> 上一行
+                // 注意这里必须用组合的 gray*, 不能用打过拍的 g*_r:
+                // g*_r 比 x_grp 落后一组, 用它写进去会让三行彼此错开一组。
+
+                if(I_tuser) begin
+                    x_grp <= 11'd1;
+                    y_pos <= 11'd0;
+                end else if(x_grp == GRP_W - 1) begin
+                    x_grp <= 11'd0;
+                    if(y_pos == IMG_HEIGHT - 1)
+                        y_pos <= 11'd0;
+                    else
+                        y_pos <= y_pos + 1'b1;
+                end else begin
+                    x_grp <= x_grp + 1'b1;
+                end
+            end
+        end
+    end
+
+endmodule
